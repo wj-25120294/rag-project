@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-Backend_url = "http://localhost:8000"
+Backend_url = "http://localhost:8600"
 st.title("RAG应用")
 if "messages" not in st.session_state:
     st.session_state.messages = []

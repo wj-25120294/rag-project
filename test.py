@@ -11,6 +11,17 @@ from langchain_core.output_parsers import StrOutputParser
 from ragas import EvaluationDataset,SingleTurnSample,evaluate
 from ragas.metrics import Faithfulness,ResponseRelevancy,ContextPrecision,ContextRecall
 from langchain_deepseek import ChatDeepSeek
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件中的环境变量
+load_dotenv()  # [reference:7]
+
+# 从环境变量中读取 API Key
+api_key = os.getenv("DEEPSEEK_API_KEY")  # [reference:9]
+
+# 接下来就可以在代码中使用 api_key 变量了
+# 例如: client = OpenAI(api_key=api_key)
 with open ("chunks.pkl","rb") as f:
     All_chunks = pickle.load(f)
 embeddings = OllamaEmbeddings(model="shaw/dmeta-embedding-zh:latest",base_url="http://127.0.0.1:11434")
@@ -81,7 +92,7 @@ dataset = EvaluationDataset(samples=samples)
 result = evaluate(
     dataset,
     metrics=[Faithfulness(),ResponseRelevancy(),ContextPrecision(),ContextRecall()],
-    llm = ChatDeepSeek(model="deepseek-chat",temperature=0.2,api_key="sk-02ee692ab01e46e68a51c19138055ff3"),
+    llm = ChatDeepSeek(model="deepseek-chat",temperature=0.2,api_key=api_key),
     embeddings=embeddings
 )
 print(result)

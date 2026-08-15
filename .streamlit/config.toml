@@ -1,0 +1,4 @@
+# Streamlit 固定端口为 8602
+# 原因: Windows 预留了 7652-8577 之间的端口段（Hyper-V/Docker），8501 落在其中绑定会被拒。
+[server]
+port = 8602

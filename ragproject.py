@@ -1,10 +1,12 @@
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
 from fastapi import FastAPI,HTTPException,UploadFile,File,Form
 from pydantic import BaseModel
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate,MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_community.document_loaders import PyPDFLoader,TextLoader,UnstructuredWordDocumentLoader
-import tempfile,os,traceback
+from langchain_community.document_loaders import TextLoader,UnstructuredWordDocumentLoader
+from mineru_parser import parse_pdf_with_mineru
+import asyncio,tempfile,traceback
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings,ChatOllama
 from operator import itemgetter
@@ -13,12 +15,24 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 import jieba
 import pickle
+from pymilvus import MilvusClient,DataType
 app = FastAPI()
-Vector =None
+Collection_Name = "rag_collection"
+embeddings = OllamaEmbeddings(model="shaw/dmeta-embedding-zh:latest")
+client = MilvusClient(uri="http://127.0.0.1:19530")
 All_chunks = []
 BM25_index = None
-os.environ["HF_HUB_OFFLINE"] = "1"
 reranker = CrossEncoder("BAAI/bge-reranker-v2-m3",device="cuda")
+def get_or_create_collection():
+    if client.has_collection(Collection_Name):
+        return 
+    schema = client.create_schema(auto_id = True,enable_dynamic_field=False)
+    schema.add_field(field_name="id",datatype=DataType.INT64,is_primary=True)
+    schema.add_field(field_name="text",datatype=DataType.VARCHAR,max_length=5000)
+    schema.add_field(field_name="embedding",datatype=DataType.FLOAT_VECTOR,dim=768)
+    index_params = client.prepare_index_params()
+    index_params.add_index(field_name="embedding",index_type="AUTOINDEX",metric_type = "COSINE")
+    client.create_collection(collection_name=Collection_Name,schema=schema,index_params=index_params)
 class AnswerResponse(BaseModel):
     question:str
     answer:str
@@ -30,7 +44,7 @@ async def upload_file(
     files :UploadFile=File(...)
 ):
     temp_path = None
-    global Vector,All_chunks,BM25_index
+    global All_chunks,BM25_index
     try:
         suffix = os.path.splitext(files.filename)[1]
         with tempfile.NamedTemporaryFile(delete=False,
@@ -39,7 +53,8 @@ async def upload_file(
             temp_file.write(content)
             temp_path = temp_file.name
         if files.content_type=="application/pdf":
-            loader = PyPDFLoader(temp_path)
+            # MinerU 解析复杂PDF（表格结构完整、质量高），丢线程池避免阻塞事件循环
+            docs = await asyncio.to_thread(parse_pdf_with_mineru, temp_path)
         elif files.content_type=="text/plain":
             # 逐个尝试编码，找到能成功加载的就用
             docs = None
@@ -62,20 +77,10 @@ async def upload_file(
             separators=["\n\n","\n","。","？","，"," "]
         )
         chunks = text_spliter.split_documents(docs)
-        try:
-            embeddings = OllamaEmbeddings(model="shaw/dmeta-embedding-zh:latest")
-        except:
-            raise HTTPException(
-                status_code=400,
-                detail="Ollama服务未启用"
-            )
-        
-        if Vector is None:
-            Vector = FAISS.from_documents(documents=chunks, embedding=embeddings)
-            All_chunks = chunks
-        else:
-            Vector.add_documents(documents=chunks)
-            All_chunks.extend(chunks)
+        vectors = embeddings.embed_documents([d.page_content for d in chunks])
+        get_or_create_collection()
+        client.insert(collection_name=Collection_Name,data=[{"text":d.page_content,"embedding":vectors[i]}for i,d in enumerate(chunks)])
+        All_chunks.extend(chunks)
         tokenized_docs = [list(jieba.cut(d.page_content)) for d in All_chunks]
         BM25_index = BM25Okapi(tokenized_docs,k1=1.5,b=0.75)
         with open("chunks.pkl","wb") as f:
@@ -94,8 +99,8 @@ async def upload_file(
 async def ask_question(
     rep:AskResponse
 ):
-    global Vector,All_chunks,BM25_index,reranker
-    if Vector is None:
+    global All_chunks,BM25_index,reranker
+    if not All_chunks:
         raise HTTPException(status_code=500,detail="请上传文件")
     try:
         tokenized_q = list(jieba.cut(rep.question))
@@ -106,12 +111,25 @@ async def ask_question(
             reverse=True
         )[:10]
         bm25_docs = [All_chunks[i] for i in top_bm25 if bm25_scores[i]>0]
-        faiss_docs = []
-        for doc,score in Vector.similarity_search_with_score(rep.question,k=10):
-            faiss_docs.append(doc)
+        query_vec = embeddings.embed_query(rep.question)
+        get_or_create_collection()
+        res = client.search(
+                    collection_name=Collection_Name,
+                    data=[query_vec],
+                    limit=10,
+                    output_fields=["text"],
+                    search_params={"metric_type":"COSINE"}
+                )
+        milvus_texts = [h["entity"]["text"]for h in res[0]]
+        milvus_docs =[]
+        for t in milvus_texts:
+            for d in All_chunks:
+                if d.page_content == t and d not in milvus_docs:
+                    milvus_docs.append(d)
+                    break
         seen =set()
         final_docs =[]
-        for doc in bm25_docs+faiss_docs:
+        for doc in bm25_docs+milvus_docs:
             if doc.page_content not in seen:
                 seen.add(doc.page_content)
                 final_docs.append(doc)
@@ -154,4 +172,4 @@ async def ask_question(
         raise HTTPException(status_code=500,detail=str(e))
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8600)
